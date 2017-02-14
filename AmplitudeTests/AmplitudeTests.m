@@ -15,6 +15,7 @@
 #import "BaseTestCase.h"
 #import "AMPDeviceInfo.h"
 #import "AMPARCMacros.h"
+#import "AMPUtils.h"
 
 // expose private methods for unit testing
 @interface Amplitude (Tests)
@@ -248,34 +249,6 @@
     XCTAssertFalse([[event2 allKeys] containsObject:@"user_id"]);
 }
 
-- (void)testLogEventUploadLogic {
-    NSMutableDictionary *serverResponse = [NSMutableDictionary dictionaryWithDictionary:
-                                            @{ @"response" : [[NSHTTPURLResponse alloc] initWithURL:[NSURL URLWithString:@"/"] statusCode:200 HTTPVersion:nil headerFields:@{}],
-                                            @"data" : [@"bad_checksum" dataUsingEncoding:NSUTF8StringEncoding]
-                                            }];
-
-    [self setupAsyncResponse:_connectionMock response:serverResponse];
-    for (int i = 0; i < kAMPEventUploadThreshold; i++) {
-        [self.amplitude logEvent:@"test"];
-    }
-    [self.amplitude logEvent:@"test"];
-    [self.amplitude flushQueue];
-
-    // no sent events, event count will be threshold + 1
-    XCTAssertEqual([self.amplitude queuedEventCount], kAMPEventUploadThreshold + 1);
-
-    [serverResponse setValue:[@"request_db_write_failed" dataUsingEncoding:NSUTF8StringEncoding] forKey:@"data"];
-    [self setupAsyncResponse:_connectionMock response:serverResponse];
-    for (int i = 0; i < kAMPEventUploadThreshold; i++) {
-        [self.amplitude logEvent:@"test"];
-    }
-    [self.amplitude flushQueue];
-    XCTAssertEqual([self.amplitude queuedEventCount], 2 * kAMPEventUploadThreshold + 1);
-
-    // make post request should only be called 3 times
-    XCTAssertEqual(_connectionCallCount, 2);
-}
-
 - (void)testRequestTooLargeBackoffLogic {
     [self.amplitude setEventUploadThreshold:2];
     NSMutableDictionary *serverResponse = [NSMutableDictionary dictionaryWithDictionary:
@@ -289,11 +262,29 @@
     [self.amplitude logEvent:@"test"];
     [self.amplitude flushQueue];
 
-    // with upload limit 1 and 413 --> the top event will be deleted until no events left
-    XCTAssertEqual([self.amplitude queuedEventCount], 0);
+    // after first 413, the backoffupload batch size should now be 1
+    XCTAssertTrue(self.amplitude.backoffUpload);
+    XCTAssertEqual(self.amplitude.backoffUploadBatchSize, 1);
+    XCTAssertEqual(_connectionCallCount, 1);
+}
 
-    // sent 4 server requests: start_session, 2 events, delete top event, delete top event
-    XCTAssertEqual(_connectionCallCount, 3);
+- (void)testRequestTooLargeBackoffRemoveEvent {
+    [self.amplitude setEventUploadThreshold:1];
+    NSMutableDictionary *serverResponse = [NSMutableDictionary dictionaryWithDictionary:
+                                           @{ @"response" : [[NSHTTPURLResponse alloc] initWithURL:[NSURL URLWithString:@"/"] statusCode:413 HTTPVersion:nil headerFields:@{}],
+                                              @"data" : [@"response" dataUsingEncoding:NSUTF8StringEncoding]
+                                              }];
+
+    // 413 error force backoff with 1 events --> should drop the event
+    [self setupAsyncResponse:_connectionMock response:serverResponse];
+    [self.amplitude logEvent:@"test"];
+    [self.amplitude flushQueue];
+
+    // after first 413, the backoffupload batch size should now be 1
+    XCTAssertTrue(self.amplitude.backoffUpload);
+    XCTAssertEqual(self.amplitude.backoffUploadBatchSize, 1);
+    XCTAssertEqual(_connectionCallCount, 1);
+    XCTAssertEqual([self.databaseHelper getEventCount], 0);
 }
 
 - (void)testUUIDInEvent {
@@ -746,6 +737,82 @@
     XCTAssertEqualObjects([event objectForKey:@"user_properties"], [NSDictionary dictionary]); // user properties should be empty
     XCTAssertEqualObjects([event objectForKey:@"event_properties"], [NSDictionary dictionary]); // event properties should be empty
     XCTAssertEqualObjects([event objectForKey:@"groups"], expectedGroups);
+}
+
+-(void)testUnarchiveEventsDict {
+    NSString *archiveName = @"test_archive";
+    NSDictionary *event = [NSDictionary dictionaryWithObject:@"test event" forKey:@"event_type"];
+    XCTAssertTrue([self.amplitude archive:event toFile:archiveName]);
+
+    NSDictionary *unarchived = [self.amplitude unarchive:archiveName];
+    if (floor(NSFoundationVersionNumber) > NSFoundationVersionNumber_iOS_8_4) {
+        XCTAssertEqualObjects(unarchived, event);
+    } else {
+        XCTAssertNil(unarchived);
+    }
+}
+
+-(void)testBlockTooManyProperties {
+    AMPDatabaseHelper *dbHelper = [AMPDatabaseHelper getDatabaseHelper];
+
+    NSMutableDictionary *eventProperties = [NSMutableDictionary dictionary];
+    NSMutableDictionary *userProperties = [NSMutableDictionary dictionary];
+    AMPIdentify *identify = [AMPIdentify identify];
+    for (int i = 0; i < kAMPMaxPropertyKeys + 1; i++) {
+        [eventProperties setObject:[NSNumber numberWithInt:i] forKey:[NSNumber numberWithInt:i]];
+        [userProperties setObject:[NSNumber numberWithInt:i*2] forKey:[NSNumber numberWithInt:i*2]];
+        [identify setOnce:[NSString stringWithFormat:@"%d", i] value:[NSNumber numberWithInt:i]];
+    }
+
+    // verify that setUserProperties ignores dict completely
+    [self.amplitude setUserProperties:userProperties];
+    [self.amplitude flushQueue];
+    XCTAssertEqual([dbHelper getIdentifyCount], 0);
+
+    // verify that event properties and user properties are scrubbed
+    [self.amplitude logEvent:@"test event" withEventProperties:eventProperties];
+    [self.amplitude identify:identify];
+    [self.amplitude flushQueue];
+
+    XCTAssertEqual([dbHelper getEventCount], 1);
+    NSDictionary *event = [self.amplitude getLastEvent];
+    XCTAssertEqualObjects(event[@"event_properties"], [NSDictionary dictionary]);
+    XCTAssertEqualObjects(event[@"user_properties"], [NSDictionary dictionary]);
+
+    XCTAssertEqual([dbHelper getIdentifyCount], 1);
+    NSDictionary *identifyEvent = [self.amplitude getLastIdentify];
+    XCTAssertEqualObjects(identifyEvent[@"event_properties"], [NSDictionary dictionary]);
+    XCTAssertEqualObjects(identifyEvent[@"user_properties"], [NSDictionary dictionaryWithObject:[NSDictionary dictionary] forKey:@"$setOnce"]);
+}
+
+-(void)testLogEventWithTimestamp {
+    NSDate *date = [NSDate dateWithTimeIntervalSince1970:1000];
+    NSNumber *timestamp = [NSNumber numberWithLongLong:[date timeIntervalSince1970]];
+
+    [self.amplitude logEvent:@"test" withEventProperties:nil withGroups:nil withTimestamp:timestamp outOfSession:NO];
+    [self.amplitude flushQueue];
+    NSDictionary *event = [self.amplitude getLastEvent];
+    XCTAssertEqual(1000, [[event objectForKey:@"timestamp"] longLongValue]);
+
+    [self.amplitude logEvent:@"test2" withEventProperties:nil withGroups:nil withLongLongTimestamp:2000 outOfSession:NO];
+    [self.amplitude flushQueue];
+    event = [self.amplitude getLastEvent];
+    XCTAssertEqual(2000, [[event objectForKey:@"timestamp"] longLongValue]);
+}
+
+-(void)testRegenerateDeviceId {
+    AMPDatabaseHelper *dbHelper = [AMPDatabaseHelper getDatabaseHelper];
+    [self.amplitude flushQueue];
+    NSString *oldDeviceId = [self.amplitude getDeviceId];
+    XCTAssertFalse([AMPUtils isEmptyString:oldDeviceId]);
+    XCTAssertEqualObjects(oldDeviceId, [dbHelper getValue:@"device_id"]);
+
+    [self.amplitude regenerateDeviceId];
+    [self.amplitude flushQueue];
+    NSString *newDeviceId = [self.amplitude getDeviceId];
+    XCTAssertNotEqualObjects(oldDeviceId, newDeviceId);
+    XCTAssertEqualObjects(newDeviceId, [dbHelper getValue:@"device_id"]);
+    XCTAssertTrue([newDeviceId hasSuffix:@"R"]);
 }
 
 @end
